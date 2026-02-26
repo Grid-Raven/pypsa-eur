@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: : 2023-2024 The PyPSA-Eur Authors
+# SPDX-FileCopyrightText: Contributors to PyPSA-Eur <https://github.com/pypsa/pypsa-eur>
 #
 # SPDX-License-Identifier: MIT
 
@@ -6,11 +6,16 @@ import copy
 from functools import partial, lru_cache
 
 import os, sys, glob
+import requests
+
+
+import pandas as pd
+import json
 
 path = workflow.source_path("../scripts/_helpers.py")
 sys.path.insert(0, os.path.dirname(path))
 
-from _helpers import validate_checksum, update_config_from_wildcards
+from scripts._helpers import update_config_from_wildcards
 from snakemake.utils import update_config
 
 
@@ -78,6 +83,81 @@ def config_provider(*keys, default=None):
         return partial(static_getter, keys=keys, default=default)
 
 
+@lru_cache
+def load_data_versions(file_path):
+    data_versions = pd.read_csv(
+        file_path,
+        dtype=str,
+        na_filter=False,
+        delimiter=",",
+        comment="#",
+    )
+
+    # Turn space-separated tags into individual columns
+    data_versions["tags"] = data_versions["tags"].str.split()
+    exploded = data_versions.explode("tags")
+    dummies = pd.get_dummies(exploded["tags"], dtype=bool)
+    tags_matrix = dummies.groupby(dummies.index).max()
+    data_versions = data_versions.join(tags_matrix)
+
+    return data_versions
+
+
+def dataset_version(
+    name: str,
+) -> pd.Series:
+    """
+    Return the dataset version information and url for a given dataset name.
+
+    The dataset name is used to determine the source and version of the dataset from the configuration.
+    Then the 'data/versions.csv' file is queried to find the matching dataset entry.
+
+    Parameters:
+    name: str
+        The name of the dataset to retrieve version information for.
+
+    Returns:
+    pd.Series
+        A pandas Series containing the dataset version information, including source, version, tags, and URL
+    """
+
+    dataset_config = config["data"][
+        name
+    ]  # TODO as is right now, it is not compatible with config_provider
+
+    # To use PyPSA-Eur as a snakemake module, the path to the versions.csv file needs to be
+    # registered relative to the current file with Snakemake:
+    fp = workflow.source_path("../data/versions.csv")
+    data_versions = load_data_versions(fp)
+
+    dataset = data_versions.loc[
+        (data_versions["dataset"] == name)
+        & (data_versions["source"] == dataset_config["source"])
+        & (data_versions["supported"])  # Limit to supported versions only
+        & (
+            data_versions["version"] == dataset_config["version"]
+            if "latest" != dataset_config["version"]
+            else True
+        )
+        & (data_versions["latest"] if "latest" == dataset_config["version"] else True)
+    ]
+
+    if dataset.empty:
+        raise ValueError(
+            f"Dataset '{name}' with source '{dataset_config['source']}' for '{dataset_config['version']}' not found in data/versions.csv."
+        )
+
+    # Return single-row DataFrame as a Series
+    dataset = dataset.squeeze()
+
+    # Generate output folder path in the `data` directory
+    dataset["folder"] = Path(
+        "data", name, dataset["source"], dataset["version"]
+    ).as_posix()
+
+    return dataset
+
+
 def solver_threads(w):
     solver_options = config_provider("solving", "solver_options")(w)
     option_set = config_provider("solving", "solver", "options")(w)
@@ -98,9 +178,7 @@ def memory(w):
         if m is not None:
             factor *= int(m.group(1)) / 8760
             break
-    if w.clusters.endswith("m") or w.clusters.endswith("c"):
-        return int(factor * (55000 + 600 * int(w.clusters[:-1])))
-    elif w.clusters == "all":
+    if w.clusters == "all" or w.clusters == "adm":
         return int(factor * (18000 + 180 * 4000))
     else:
         return int(factor * (10000 + 195 * int(w.clusters)))
@@ -115,20 +193,13 @@ def input_custom_extra_functionality(w):
     return []
 
 
-# Check if the workflow has access to the internet by trying to access the HEAD of specified url
-def has_internet_access(url="www.zenodo.org") -> bool:
-    import http.client as http_client
+def output_model(path_template):
+    def _output_model(w):
+        if config_provider("solving", "options", "store_model")(w):
+            return path_template.format(**dict(w))
+        return []
 
-    # based on answer and comments from
-    # https://stackoverflow.com/a/29854274/11318472
-    conn = http_client.HTTPConnection(url, timeout=5)  # need access to zenodo anyway
-    try:
-        conn.request("HEAD", "/")
-        return True
-    except:
-        return False
-    finally:
-        conn.close()
+    return _output_model
 
 
 def solved_previous_horizon(w):
@@ -138,7 +209,20 @@ def solved_previous_horizon(w):
 
     return (
         RESULTS
-        + "postnetworks/elec_s{simpl}_{clusters}_l{ll}_{opts}_{sector_opts}_"
+        + "networks/base_s_{clusters}_{opts}_{sector_opts}_"
         + planning_horizon_p
         + ".nc"
     )
+
+
+def input_cutout(wildcards, cutout_names="default"):
+
+    cutouts_path = dataset_version("cutout")["folder"]
+
+    if cutout_names == "default":
+        cutout_names = config_provider("atlite", "default_cutout")(wildcards)
+
+    if isinstance(cutout_names, list):
+        return [f"{cutouts_path}/{cn}.nc" for cn in cutout_names]
+    else:
+        return f"{cutouts_path}/{cutout_names}.nc"
